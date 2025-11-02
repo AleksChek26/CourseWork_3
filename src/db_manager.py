@@ -1,19 +1,55 @@
-
 import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from psycopg2.extras import RealDictCursor
 from typing import List, Dict, Tuple
 from config import DB_CONFIG
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 
 class DBManager:
     """
-    Класс для работы с базой данных PostgreSQL.
-    Обеспечивает создание таблиц, загрузку данных и выполнение аналитических запросов.
+    Класс для работы с PostgreSQL: создание БД, таблиц, загрузка данных и выполнение запросов.
+    Обеспечивает:
+    - автоматическое создание БД и таблиц;
+    - добавление работодателей и вакансий;
+    - аналитические запросы к данным.
     """
 
     def __init__(self):
-        """Инициализация соединения с БД"""
+        """Инициализация подключения к системной БД 'postgres' для операций DDL"""
+        self.connection = psycopg2.connect(
+            host=DB_CONFIG['host'],
+            database='postgres',
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            port=DB_CONFIG['port']
+        )
+        self.connection.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+
+    def create_database(self):
+        """
+        Создать БД, если она не существует.
+        Использует системную БД 'postgres' для выполнения CREATE DATABASE.
+        """
+        db_name = DB_CONFIG['database']
+        with self.connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM pg_database WHERE datname='{db_name}'")
+            exists = cursor.fetchone()
+            if not exists:
+                cursor.execute(f'CREATE DATABASE {db_name}')
+                logger.info(f"БД {db_name} создана.")
+            else:
+                logger.info(f"БД {db_name} уже существует.")
+
+    def reconnect_to_target_db(self):
+        """
+        Переподключиться к целевой БД (после её создания).
+        Обновляет self.connection для работы с данными.
+        """
         self.connection = psycopg2.connect(
             host=DB_CONFIG['host'],
             database=DB_CONFIG['database'],
@@ -24,9 +60,8 @@ class DBManager:
 
     def create_tables(self):
         """
-        Создать таблицы в БД:
-        - employers: данные о компаниях
-        - vacancies: данные о вакансиях (с FK на employers)
+        Создать таблицы employers и vacancies, если они не существуют.
+        Обеспечивает целостность данных через FOREIGN KEY.
         """
         create_employers = """
         CREATE TABLE IF NOT EXISTS employers (
@@ -57,8 +92,9 @@ class DBManager:
             cursor.execute(create_employers)
             cursor.execute(create_vacancies)
         self.connection.commit()
+        logger.info("Таблицы employers и vacancies созданы (если не существовали).")
 
-    def add_employer(self, employer: Dict):
+    def add_employer(self, employer: Dict) -> None:
         """
         Добавить работодателя в таблицу employers.
         При конфликте (по employer_id) — обновляет данные.
@@ -83,43 +119,54 @@ class DBManager:
             ))
         self.connection.commit()
 
-    def add_vacancy(self, vacancy: Dict, employer_id: int):
+    def add_vacancy(self, vacancy: Dict, employer_id: int) -> None:
         """
         Добавить вакансию в таблицу vacancies.
-        При конфликте (по vacancy_id) — пропускает запись.
+        Обрабатывает ошибки и пропущенные поля.
 
         Args:
             vacancy (Dict): словарь с данными вакансии из API hh.ru
             employer_id (int): ID работодателя
         """
+        # Проверка обязательных полей
+        if 'id' not in vacancy or 'name' not in vacancy:
+            logger.warning(f"Пропущена вакансия: отсутствуют обязательные поля {vacancy}")
+            return
+
         salary = vacancy.get('salary')
         salary_from = salary.get('from') if salary else None
         salary_to = salary.get('to') if salary else None
         currency = salary.get('currency') if salary else None
+        url = vacancy.get('alternate_url', 'N/A')  # Запасной вариант для URL
 
         query = """
         INSERT INTO vacancies (vacancy_id, employer_id, title, salary_from, salary_to, currency, url)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (vacancy_id) DO NOTHING;
         """
-        with self.connection.cursor() as cursor:
-            cursor.execute(query, (
-                vacancy['id'],
-                employer_id,
-                vacancy['name'],
-                salary_from,
-                salary_to,
-                currency,
-                vacancy['alternate_url']
-            ))
-        self.connection.commit()
 
-    def get_companies_and_vacancies_count(self) -> List[Tuple]:
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(query, (
+                    vacancy['id'],
+                    employer_id,
+                    vacancy['name'],
+                    salary_from,
+                    salary_to,
+                    currency,
+                    url
+                ))
+            self.connection.commit()
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении вакансии {vacancy['id']}: {e}")
+            self.connection.rollback()
+
+    def get_companies_and_vacancies_count(self) -> List[Tuple[str, int]]:
         """
-        Получить список всех компаний и количество вакансий у каждой.
+        Получить список компаний и количество их вакансий.
 
         Returns:
-            List[Tuple]: список кортежей (название компании, количество вакансий)
+            List[Tuple[str, int]]: список кортежей (название компании, количество вакансий)
         """
         query = """
         SELECT e.name, COUNT(v.id) as vacancy_count
@@ -134,14 +181,16 @@ class DBManager:
 
     def get_all_vacancies(self) -> List[Dict]:
         """
-        Получить все вакансии с указанием:
-        - названия компании
-        - названия вакансии
-        - зарплаты (от и до)
-        - ссылки на вакансию
+        Получить все вакансии с деталями.
 
         Returns:
-            List[Dict]: список словарей с данными вакансий
+            List[Dict]: список словарей с полями:
+                - company_name
+                - vacancy_title
+                - salary_from
+                - salary_to
+                - currency
+                - url
         """
         query = """
         SELECT
@@ -160,12 +209,16 @@ class DBManager:
 
     def get_avg_salary(self) -> float:
         """
-        Получить среднюю зарплату по всем вакансиям (по полю salary_from).
+        Вычислить среднюю зарплату по всем вакансиям (по полю salary_from).
 
         Returns:
             float: средняя зарплата (0.0, если данных нет)
         """
-        query = "SELECT AVG(salary_from) as avg_salary FROM vacancies WHERE salary_from IS NOT NULL;"
+        query = """
+        SELECT AVG(salary_from) as avg_salary
+        FROM vacancies
+        WHERE salary_from IS NOT NULL;
+        """
         with self.connection.cursor() as cursor:
             cursor.execute(query)
             result = cursor.fetchone()
@@ -173,13 +226,16 @@ class DBManager:
 
     def get_vacancies_with_higher_salary(self) -> List[Dict]:
         """
-        Получить список вакансий, у которых зарплата выше средней по всем вакансиям.
+        Получить вакансии с зарплатой выше средней.
 
         Returns:
-            List[Dict]: список словарей с данными вакансий (компания, название, зарплата, ссылка)
+            List[Dict]: список вакансий (с теми же полями, что и в get_all_vacancies)
         """
         avg_salary = self.get_avg_salary()
-        query = f"""
+        if avg_salary == 0.0:
+            return []
+
+        query = """
         SELECT
             e.name as company_name,
             v.title as vacancy_title,
@@ -189,21 +245,22 @@ class DBManager:
             v.url
         FROM vacancies v
         JOIN employers e ON v.employer_id = e.employer_id
-        WHERE v.salary_from > {avg_salary};
+        WHERE v.salary_from > %s
+        ORDER BY v.salary_from DESC;
         """
         with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query)
+            cursor.execute(query, (avg_salary,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_vacancies_with_keyword(self, keyword: str) -> List[Dict]:
         """
-        Получить список вакансий, в названии которых содержится ключевое слово.
+        Поиск вакансий по ключевому слову в названии.
 
         Args:
-            keyword (str): ключевое слово для поиска (без учёта регистра)
+            keyword (str): ключевое слово для поиска
 
         Returns:
-            List[Dict]: список словарей с данными вакансий (компания, название, зарплата, ссылка)
+            List[Dict]: список подходящих вакансий (с полями как в get_all_vacancies)
         """
         query = """
         SELECT
@@ -215,11 +272,19 @@ class DBManager:
             v.url
         FROM vacancies v
         JOIN employers e ON v.employer_id = e.employer_id
-        WHERE LOWER(v.title) LIKE LOWER(%s);
+        WHERE LOWER(v.title) LIKE LOWER(%s)
+        ORDER BY e.name, v.title;
         """
         search_pattern = f"%{keyword}%"
-
         with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, (search_pattern,))
             return [dict(row) for row in cursor.fetchall()]
-        
+
+    def close(self) -> None:
+        """
+        Закрыть соединение с БД.
+        Вызывать при завершении работы с менеджером.
+        """
+        if self.connection:
+            self.connection.close()
+            logger.info("Соединение с БД закрыто.")

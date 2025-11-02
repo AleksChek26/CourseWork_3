@@ -17,23 +17,30 @@ class HHApiClient:
         return None
 
     def get_vacancies_by_employer(self, employer_id: int) -> List[Dict]:
-        """Получить вакансии работодателя"""
+        """Получить все вакансии работодателя (с пагинацией)"""
         url = f"{self.base_url}/vacancies"
-        params = {'employer_id': employer_id, 'per_page': 100}
-        response = requests.get(url, params=params)
+        params = {
+            'employer_id': employer_id,
+            'per_page': 100,
+            'page': 0
+        }
+        all_vacancies = []
 
-        if response.status_code == 200:
+        while True:
+            response = requests.get(url, params=params)
+            if response.status_code != 200:
+                break
+
             data = response.json()
-            return data.get('items', [])
-        return []
+            vacancies = data.get('items', [])
+            if not vacancies:
+                break
 
-    def search_employers(self, query: str) -> List[Dict]:
-        """Поиск работодателей по названию"""
-        url = f"{self.base_url}/employers"
-        params = {'text': query, 'per_page': 10}
-        response = requests.get(url, params=params)
+            all_vacancies.extend(vacancies)
+            params['page'] += 1
 
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('items', [])
-        return []
+            # Защита от бесконечного цикла
+            if params['page'] >= 20:  # максимум 2000 вакансий
+                break
+
+        return all_vacancies
